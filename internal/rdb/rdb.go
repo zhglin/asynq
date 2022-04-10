@@ -21,15 +21,18 @@ import (
 const statsTTL = 90 * 24 * time.Hour // 90 days
 
 // LeaseDuration is the duration used to initially create a lease and to extend it thereafter.
+// 消息active的租赁时间
 const LeaseDuration = 30 * time.Second
 
 // RDB is a client interface to query and mutate task queues.
+// RDB是一个用于查询和修改任务队列的客户端接口。
 type RDB struct {
-	client redis.UniversalClient
-	clock  timeutil.Clock
+	client redis.UniversalClient // redis链接
+	clock  timeutil.Clock        // 时钟
 }
 
 // NewRDB returns a new instance of RDB.
+// 返回一个RDB的新实例。
 func NewRDB(client redis.UniversalClient) *RDB {
 	return &RDB{
 		client: client,
@@ -38,11 +41,13 @@ func NewRDB(client redis.UniversalClient) *RDB {
 }
 
 // Close closes the connection with redis server.
+// 关闭与redis server的连接。
 func (r *RDB) Close() error {
 	return r.client.Close()
 }
 
 // Client returns the reference to underlying redis client.
+// 返回对底层redis客户端的引用。
 func (r *RDB) Client() redis.UniversalClient {
 	return r.client
 }
@@ -50,15 +55,19 @@ func (r *RDB) Client() redis.UniversalClient {
 // SetClock sets the clock used by RDB to the given clock.
 //
 // Use this function to set the clock to SimulatedClock in tests.
+// 设置RDB使用的时钟为给定的时钟。
+// 在测试中使用此函数将时钟设置为SimulatedClock。
 func (r *RDB) SetClock(c timeutil.Clock) {
 	r.clock = c
 }
 
 // Ping checks the connection with redis server.
+// 检查与redis服务器的连接。
 func (r *RDB) Ping() error {
 	return r.client.Ping(context.Background()).Err()
 }
 
+// 执行脚本
 func (r *RDB) runScript(ctx context.Context, op errors.Op, script *redis.Script, keys []string, args ...interface{}) error {
 	if err := script.Run(ctx, r.client, keys, args...).Err(); err != nil {
 		return errors.E(op, errors.Internal, fmt.Sprintf("redis eval error: %v", err))
@@ -67,6 +76,7 @@ func (r *RDB) runScript(ctx context.Context, op errors.Op, script *redis.Script,
 }
 
 // Runs the given script with keys and args and retuns the script's return value as int64.
+// 使用键和参数运行给定的脚本，并将脚本的返回值返回为int64。
 func (r *RDB) runScriptWithErrorCode(ctx context.Context, op errors.Op, script *redis.Script, keys []string, args ...interface{}) (int64, error) {
 	res, err := script.Run(ctx, r.client, keys, args...).Result()
 	if err != nil {
@@ -82,16 +92,19 @@ func (r *RDB) runScriptWithErrorCode(ctx context.Context, op errors.Op, script *
 // enqueueCmd enqueues a given task message.
 //
 // Input:
-// KEYS[1] -> asynq:{<qname>}:t:<task_id>
-// KEYS[2] -> asynq:{<qname>}:pending
+// KEYS[1] -> asynq:{<qname>}:t:<task_id> // task唯一标识
+// KEYS[2] -> asynq:{<qname>}:pending	// 写入的队列名
 // --
-// ARGV[1] -> task message data
-// ARGV[2] -> task ID
-// ARGV[3] -> current unix time in nsec
+// ARGV[1] -> task message data	// task的消息内容
+// ARGV[2] -> task ID			// 消息id
+// ARGV[3] -> current unix time in nsec // 当前的纳秒时间
 //
 // Output:
 // Returns 1 if successfully enqueued
 // Returns 0 if task ID already exists
+// EXISTS task唯一标识
+// HSET task唯一标识 msg task内容 state 状态 pending_since 当前纳秒时间戳
+// LPUSH 队列名 task唯一标识
 var enqueueCmd = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 1 then
 	return 0
@@ -105,12 +118,16 @@ return 1
 `)
 
 // Enqueue adds the given task to the pending list of the queue.
+// 将给定任务添加到队列的待处理队列中。
+// pending队列
 func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 	var op errors.Op = "rdb.Enqueue"
+	// 编码
 	encoded, err := base.EncodeMessage(msg)
 	if err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
 	}
+	// set添加queue名
 	if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
 	}
@@ -135,19 +152,23 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 
 // enqueueUniqueCmd enqueues the task message if the task is unique.
 //
-// KEYS[1] -> unique key
-// KEYS[2] -> asynq:{<qname>}:t:<taskid>
-// KEYS[3] -> asynq:{<qname>}:pending
+// KEYS[1] -> unique key					// 唯一键
+// KEYS[2] -> asynq:{<qname>}:t:<taskid>    // task标识
+// KEYS[3] -> asynq:{<qname>}:pending       // 队列名
 // --
-// ARGV[1] -> task ID
-// ARGV[2] -> uniqueness lock TTL
-// ARGV[3] -> task message data
-// ARGV[4] -> current unix time in nsec
+// ARGV[1] -> task ID						// 消息id
+// ARGV[2] -> uniqueness lock TTL           // 唯一锁定时长
+// ARGV[3] -> task message data             // task信息
+// ARGV[4] -> current unix time in nsec     // 当前的纳秒时间戳
 //
 // Output:
 // Returns 1 if successfully enqueued
 // Returns 0 if task ID conflicts with another task
 // Returns -1 if task unique key already exists
+// set 唯一键 消息id nx ex 过期时间
+// EXISTS task标识
+// HSET task标识 msg task内容 state pending pending_since 当前纳秒时间戳 unique_key 唯一键
+// LPUSH 队列名 task标识
 var enqueueUniqueCmd = redis.NewScript(`
 local ok = redis.call("SET", KEYS[1], ARGV[1], "NX", "EX", ARGV[2])
 if not ok then
@@ -167,12 +188,17 @@ return 1
 
 // EnqueueUnique inserts the given task if the task's uniqueness lock can be acquired.
 // It returns ErrDuplicateTask if the lock cannot be acquired.
+// 如果任务的惟一锁可以被获取，那么EnqueueUnique将插入给定的任务。
+// 如果无法获取锁，返回ErrDuplicateTask。
+// pending队列
 func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time.Duration) error {
 	var op errors.Op = "rdb.EnqueueUnique"
+	// 编码
 	encoded, err := base.EncodeMessage(msg)
 	if err != nil {
 		return errors.E(op, errors.Internal, "cannot encode task message: %v", err)
 	}
+	// set中写入队列名
 	if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
 	}
@@ -201,13 +227,13 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 }
 
 // Input:
-// KEYS[1] -> asynq:{<qname>}:pending
-// KEYS[2] -> asynq:{<qname>}:paused
-// KEYS[3] -> asynq:{<qname>}:active
-// KEYS[4] -> asynq:{<qname>}:lease
+// KEYS[1] -> asynq:{<qname>}:pending  //pending队列名
+// KEYS[2] -> asynq:{<qname>}:paused   //paused队列名
+// KEYS[3] -> asynq:{<qname>}:active   //active队列名
+// KEYS[4] -> asynq:{<qname>}:lease    //lease队列名
 // --
-// ARGV[1] -> initial lease expiration Unix time
-// ARGV[2] -> task key prefix
+// ARGV[1] -> initial lease expiration Unix time // 租约时间长
+// ARGV[2] -> task key prefix	                 // task前缀
 //
 // Output:
 // Returns nil if no processable task is found in the given queue.
@@ -215,11 +241,18 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 //
 // Note: dequeueCmd checks whether a queue is paused first, before
 // calling RPOPLPUSH to pop a task from the queue.
+// EXISTS paused队列名   // 已暂停return nil
+// RPOPLPUSH  pending队列名  active队列名  // pending队列最后一个元素写入active队列，获取不到返回 nil
+// local key = ARGV[2] .. id // task前缀拼接taskId=task标识
+// HSET key state active  // 设置task状态=active
+// HDEL key pending_since // 删除pending_sine
+// ZADD lease队列名 租约时间长 key
+// HGET key msg // 获取task内容
 var dequeueCmd = redis.NewScript(`
 if redis.call("EXISTS", KEYS[2]) == 0 then
 	local id = redis.call("RPOPLPUSH", KEYS[1], KEYS[3])
 	if id then
-		local key = ARGV[2] .. id
+		local key = ARGV[2] .. id 
 		redis.call("HSET", key, "state", "active")
 		redis.call("HDEL", key, "pending_since")
 		redis.call("ZADD", KEYS[4], ARGV[1], id)
@@ -232,6 +265,10 @@ return nil`)
 // off a queue if one exists and returns the message and its lease expiration time.
 // Dequeue skips a queue if the queue is paused.
 // If all queues are empty, ErrNoProcessableTask error is returned.
+// 按顺序退出给定队列的查询，如果队列存在，弹出任务消息，并返回消息和它的租约过期时间。
+// 如果队列被暂停，Dequeue会跳过队列。
+// 如果所有队列都为空，则返回ErrNoProcessableTask错误。
+// pending队列写入active队列
 func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationTime time.Time, err error) {
 	var op errors.Op = "rdb.Dequeue"
 	for _, qname := range qnames {
@@ -246,21 +283,25 @@ func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationT
 			leaseExpirationTime.Unix(),
 			base.TaskKeyPrefix(qname),
 		}
+		// 获取task内容
 		res, err := dequeueCmd.Run(context.Background(), r.client, keys, argv...).Result()
 		if err == redis.Nil {
 			continue
 		} else if err != nil {
 			return nil, time.Time{}, errors.E(op, errors.Unknown, fmt.Sprintf("redis eval error: %v", err))
 		}
+		// 结果转成string
 		encoded, err := cast.ToStringE(res)
 		if err != nil {
 			return nil, time.Time{}, errors.E(op, errors.Internal, fmt.Sprintf("cast error: unexpected return value from Lua script: %v", res))
 		}
+		// 解码
 		if msg, err = base.DecodeMessage([]byte(encoded)); err != nil {
 			return nil, time.Time{}, errors.E(op, errors.Internal, fmt.Sprintf("cannot decode message: %v", err))
 		}
 		return msg, leaseExpirationTime, nil
 	}
+	// 获取不到数据
 	return nil, time.Time{}, errors.E(op, errors.NotFound, errors.ErrNoProcessableTask)
 }
 
@@ -296,16 +337,25 @@ end
 return redis.status_reply("OK")
 `)
 
-// KEYS[1] -> asynq:{<qname>}:active
-// KEYS[2] -> asynq:{<qname>}:lease
-// KEYS[3] -> asynq:{<qname>}:t:<task_id>
-// KEYS[4] -> asynq:{<qname>}:processed:<yyyy-mm-dd>
-// KEYS[5] -> asynq:{<qname>}:processed
-// KEYS[6] -> unique key
+// KEYS[1] -> asynq:{<qname>}:active					// active队列名
+// KEYS[2] -> asynq:{<qname>}:lease						// lease队列名
+// KEYS[3] -> asynq:{<qname>}:t:<task_id>				// task标识
+// KEYS[4] -> asynq:{<qname>}:processed:<yyyy-mm-dd>	// 当天processed队列名
+// KEYS[5] -> asynq:{<qname>}:processed					// 总的processed队列名
+// KEYS[6] -> unique key								// task唯一键
 // -------
-// ARGV[1] -> task ID
-// ARGV[2] -> stats expiration timestamp
-// ARGV[3] -> max int64 value
+// ARGV[1] -> task ID									// taskId
+// ARGV[2] -> stats expiration timestamp				// 过期时间
+// ARGV[3] -> max int64 value							// 标记
+// LREM active队列名 0 taskId							// 从active队列中删掉
+// ZREM lease队列名 taskId								// 从lease中删掉
+// DEL task标识											// 删除task
+// INCR 当天processed队列名								// 计数
+// EXPIREAT 当天processed队列名							// 设置过期时间
+// GET 总的processed队列名
+// SET 总的processed队列名 1	|| INCR 总的processed队列名
+// GET task唯一键
+// DEL task唯一键
 var doneUniqueCmd = redis.NewScript(`
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
   return redis.error_reply("NOT FOUND")
@@ -334,6 +384,9 @@ return redis.status_reply("OK")
 
 // Done removes the task from active queue and deletes the task.
 // It removes a uniqueness lock acquired by the task, if any.
+// 将任务从活动队列中移除并删除。
+// 删除任务获取的惟一锁(如果有的话)。
+// 删除task数据
 func (r *RDB) Done(ctx context.Context, msg *base.TaskMessage) error {
 	var op errors.Op = "rdb.Done"
 	now := r.clock.Now()
@@ -394,19 +447,29 @@ end
 return redis.status_reply("OK")
 `)
 
-// KEYS[1] -> asynq:{<qname>}:active
-// KEYS[2] -> asynq:{<qname>}:lease
-// KEYS[3] -> asynq:{<qname>}:completed
-// KEYS[4] -> asynq:{<qname>}:t:<task_id>
-// KEYS[5] -> asynq:{<qname>}:processed:<yyyy-mm-dd>
-// KEYS[6] -> asynq:{<qname>}:processed
-// KEYS[7] -> asynq:{<qname>}:unique:{<checksum>}
+// KEYS[1] -> asynq:{<qname>}:active					// active队列名
+// KEYS[2] -> asynq:{<qname>}:lease						// lease队列名
+// KEYS[3] -> asynq:{<qname>}:completed					// completed队列名
+// KEYS[4] -> asynq:{<qname>}:t:<task_id>				// task标识
+// KEYS[5] -> asynq:{<qname>}:processed:<yyyy-mm-dd>	// 当天processed的队列名
+// KEYS[6] -> asynq:{<qname>}:processed					// 总的processed队列名
+// KEYS[7] -> asynq:{<qname>}:unique:{<checksum>}		// 唯一键
 //
-// ARGV[1] -> task ID
-// ARGV[2] -> stats expiration timestamp
-// ARGV[3] -> task exipration time in unix time
-// ARGV[4] -> task message data
-// ARGV[5] -> max int64 value
+// ARGV[1] -> task ID									// taskId
+// ARGV[2] -> stats expiration timestamp				// 过期时间
+// ARGV[3] -> task exipration time in unix time			// 任务保留的时间
+// ARGV[4] -> task message data							// 消息内容
+// ARGV[5] -> max int64 value							// 标记
+// LREM active队列名 0 taskId							// 从active中删除
+// ZREM lease队列名 taskId								// 从lease中删除
+// ZADD completed队列名 任务保留的时间 taskId				// 添加到completed有序集合
+// HSET task标识 msg 消息内容 "state", "completed"		// 设置task信息
+// INCR 当天processed的队列名
+// EXPIREAT 当天processed的队列名 过期时间
+// GET 总的processed队列名
+// SET 总的processed队列名 1 || INCR 总的processed队列名
+// GET 唯一键
+// DEL 唯一键
 var markAsCompleteUniqueCmd = redis.NewScript(`
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
   return redis.error_reply("NOT FOUND")
@@ -436,6 +499,10 @@ return redis.status_reply("OK")
 
 // MarkAsComplete removes the task from active queue to mark the task as completed.
 // It removes a uniqueness lock acquired by the task, if any.
+// task处理成功的记录
+// MarkAsComplete将任务从活动队列中移除，标记为已完成。
+// 删除任务获取的惟一锁(如果有的话)。
+// completed队列
 func (r *RDB) MarkAsComplete(ctx context.Context, msg *base.TaskMessage) error {
 	var op errors.Op = "rdb.MarkAsComplete"
 	now := r.clock.Now()
@@ -461,6 +528,7 @@ func (r *RDB) MarkAsComplete(ctx context.Context, msg *base.TaskMessage) error {
 		int64(math.MaxInt64),
 	}
 	// Note: We cannot pass empty unique key when running this script in redis-cluster.
+	// 注意:当在redis-cluster中运行这个脚本时，我们不能传递空的唯一键。
 	if len(msg.UniqueKey) > 0 {
 		keys = append(keys, msg.UniqueKey)
 		return r.runScript(ctx, op, markAsCompleteUniqueCmd, keys, argv...)
@@ -468,12 +536,16 @@ func (r *RDB) MarkAsComplete(ctx context.Context, msg *base.TaskMessage) error {
 	return r.runScript(ctx, op, markAsCompleteCmd, keys, argv...)
 }
 
-// KEYS[1] -> asynq:{<qname>}:active
-// KEYS[2] -> asynq:{<qname>}:lease
-// KEYS[3] -> asynq:{<qname>}:pending
-// KEYS[4] -> asynq:{<qname>}:t:<task_id>
-// ARGV[1] -> task ID
+// KEYS[1] -> asynq:{<qname>}:active		// active队列
+// KEYS[2] -> asynq:{<qname>}:lease			// lease队列
+// KEYS[3] -> asynq:{<qname>}:pending       // pending队列
+// KEYS[4] -> asynq:{<qname>}:t:<task_id>   // task标识
+// ARGV[1] -> task ID						// taskId
 // Note: Use RPUSH to push to the head of the queue.
+// LREM active队列 0 taskId  	// 从active队列删除taskId，失败返回not found
+// ZREM lease队列  taskId        // 从lease队列删除taskId, 失败返回not found
+// RPUSH pending队列 taskId      // 写入pending队列
+// HSET task标识 state pending   // 设置task状态
 var requeueCmd = redis.NewScript(`
 if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
   return redis.error_reply("NOT FOUND")
@@ -486,6 +558,8 @@ redis.call("HSET", KEYS[4], "state", "pending")
 return redis.status_reply("OK")`)
 
 // Requeue moves the task from active queue to the specified queue.
+// 将任务从active队列移动到pending队列。
+// pending队列
 func (r *RDB) Requeue(ctx context.Context, msg *base.TaskMessage) error {
 	var op errors.Op = "rdb.Requeue"
 	keys := []string{
@@ -497,16 +571,19 @@ func (r *RDB) Requeue(ctx context.Context, msg *base.TaskMessage) error {
 	return r.runScript(ctx, op, requeueCmd, keys, msg.ID)
 }
 
-// KEYS[1] -> asynq:{<qname>}:t:<task_id>
-// KEYS[2] -> asynq:{<qname>}:scheduled
+// KEYS[1] -> asynq:{<qname>}:t:<task_id>	// task标识
+// KEYS[2] -> asynq:{<qname>}:scheduled     // 队列名
 // -------
-// ARGV[1] -> task message data
-// ARGV[2] -> process_at time in Unix time
-// ARGV[3] -> task ID
+// ARGV[1] -> task message data				// task内容
+// ARGV[2] -> process_at time in Unix time  // 开始执行的时间戳
+// ARGV[3] -> task ID 						// taskId
 //
 // Output:
 // Returns 1 if successfully enqueued
 // Returns 0 if task ID already exists
+// EXISTS task标识
+// HSET task标识 msg task内容 state scheduled
+// ZADD 队列名 开始执行的时间戳 taskId
 var scheduleCmd = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 1 then
 	return 0
@@ -519,6 +596,8 @@ return 1
 `)
 
 // Schedule adds the task to the scheduled set to be processed in the future.
+// 将任务添加到将来要处理的计划集。
+// Scheduled队列
 func (r *RDB) Schedule(ctx context.Context, msg *base.TaskMessage, processAt time.Time) error {
 	var op errors.Op = "rdb.Schedule"
 	encoded, err := base.EncodeMessage(msg)
@@ -547,19 +626,23 @@ func (r *RDB) Schedule(ctx context.Context, msg *base.TaskMessage, processAt tim
 	return nil
 }
 
-// KEYS[1] -> unique key
-// KEYS[2] -> asynq:{<qname>}:t:<task_id>
-// KEYS[3] -> asynq:{<qname>}:scheduled
+// KEYS[1] -> unique key					// 锁定唯一键
+// KEYS[2] -> asynq:{<qname>}:t:<task_id>   // task标识
+// KEYS[3] -> asynq:{<qname>}:scheduled     // 队列名
 // -------
-// ARGV[1] -> task ID
-// ARGV[2] -> uniqueness lock TTL
-// ARGV[3] -> score (process_at timestamp)
-// ARGV[4] -> task message
+// ARGV[1] -> task ID                       // taskId
+// ARGV[2] -> uniqueness lock TTL           // 唯一锁定时长
+// ARGV[3] -> score (process_at timestamp)  // 开始执行的时间
+// ARGV[4] -> task message					// task内容
 //
 // Output:
 // Returns 1 if successfully scheduled
 // Returns 0 if task ID already exists
 // Returns -1 if task unique key already exists
+// SET 锁定唯一键 taskId NX EX 锁定时长
+// EXISTS task标识
+// HSET task标识 msg task内容 state scheduled unique_key 锁定唯一键
+// ZADD 队列名 开始执行时间 taskId
 var scheduleUniqueCmd = redis.NewScript(`
 local ok = redis.call("SET", KEYS[1], ARGV[1], "NX", "EX", ARGV[2])
 if not ok then
@@ -578,12 +661,17 @@ return 1
 
 // ScheduleUnique adds the task to the backlog queue to be processed in the future if the uniqueness lock can be acquired.
 // It returns ErrDuplicateTask if the lock cannot be acquired.
+// ScheduleUnique将任务添加到待处理的backlog队列中，如果可以获取唯一性锁。
+// 如果无法获取锁，返回ErrDuplicateTask。
+// Scheduled队列
 func (r *RDB) ScheduleUnique(ctx context.Context, msg *base.TaskMessage, processAt time.Time, ttl time.Duration) error {
 	var op errors.Op = "rdb.ScheduleUnique"
+	// 编码
 	encoded, err := base.EncodeMessage(msg)
 	if err != nil {
 		return errors.E(op, errors.Internal, fmt.Sprintf("cannot encode task message: %v", err))
 	}
+	// set记录队列名
 	if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
 	}
@@ -611,21 +699,32 @@ func (r *RDB) ScheduleUnique(ctx context.Context, msg *base.TaskMessage, process
 	return nil
 }
 
-// KEYS[1] -> asynq:{<qname>}:t:<task_id>
-// KEYS[2] -> asynq:{<qname>}:active
-// KEYS[3] -> asynq:{<qname>}:lease
-// KEYS[4] -> asynq:{<qname>}:retry
-// KEYS[5] -> asynq:{<qname>}:processed:<yyyy-mm-dd>
-// KEYS[6] -> asynq:{<qname>}:failed:<yyyy-mm-dd>
-// KEYS[7] -> asynq:{<qname>}:processed
-// KEYS[8] -> asynq:{<qname>}:failed
+// KEYS[1] -> asynq:{<qname>}:t:<task_id> 				// task标识
+// KEYS[2] -> asynq:{<qname>}:active					// active队列名
+// KEYS[3] -> asynq:{<qname>}:lease						// lease队列名
+// KEYS[4] -> asynq:{<qname>}:retry						// retry队列名
+// KEYS[5] -> asynq:{<qname>}:processed:<yyyy-mm-dd>	// 当天的processed对列名
+// KEYS[6] -> asynq:{<qname>}:failed:<yyyy-mm-dd>		// 当天的failed对列名
+// KEYS[7] -> asynq:{<qname>}:processed					// processed总的队列名
+// KEYS[8] -> asynq:{<qname>}:failed					// failed总的队列名
 // -------
-// ARGV[1] -> task ID
-// ARGV[2] -> updated base.TaskMessage value
-// ARGV[3] -> retry_at UNIX timestamp
-// ARGV[4] -> stats expiration timestamp
-// ARGV[5] -> is_failure (bool)
-// ARGV[6] -> max int64 value
+// ARGV[1] -> task ID									// taskId
+// ARGV[2] -> updated base.TaskMessage value			// task内容
+// ARGV[3] -> retry_at UNIX timestamp					// 重试时间
+// ARGV[4] -> stats expiration timestamp				// 过期时间
+// ARGV[5] -> is_failure (bool)							// 是否失败
+// ARGV[6] -> max int64 value							// int64的最大值，标记
+// LREM active队列名 0 taskId   		// 从active队列中删除taskId
+// ZREM lease队列名 taskId      		// 从lease队列中删除taskId
+// ZADD retry对列名 重试时间 taskId 	// 添加到retry有序集合中
+// HSET task标识 msg task内容 state retry	// 记录task内容
+// INCR 当天的processed对列名
+// EXPIREAT 当天的processed对列名 过期时间
+// INCR 当天的failed对列名
+// EXPIREAT 当天的failed对列名 过期时间
+// GET processed总的队列名 // 有值就incr
+// SET processed总的队列名 1   || INCR processed总的队列名
+// SET failed总的队列名 1      || INCR failed总的队列名
 var retryCmd = redis.NewScript(`
 if redis.call("LREM", KEYS[2], 0, ARGV[1]) == 0 then
   return redis.error_reply("NOT FOUND")
@@ -658,9 +757,13 @@ return redis.status_reply("OK")`)
 // Retry moves the task from active to retry queue.
 // It also annotates the message with the given error message and
 // if isFailure is true increments the retried counter.
+// Retry将任务从活动状态移到重试队列中。
+// 它还用给定的错误消息注释消息，如果isFailure为true，则增加重试计数器。
+// retry队列
 func (r *RDB) Retry(ctx context.Context, msg *base.TaskMessage, processAt time.Time, errMsg string, isFailure bool) error {
 	var op errors.Op = "rdb.Retry"
 	now := r.clock.Now()
+	// 设置task失败信息
 	modified := *msg
 	if isFailure {
 		modified.Retried++
@@ -694,26 +797,38 @@ func (r *RDB) Retry(ctx context.Context, msg *base.TaskMessage, processAt time.T
 }
 
 const (
-	maxArchiveSize           = 10000 // maximum number of tasks in archive
-	archivedExpirationInDays = 90    // number of days before an archived task gets deleted permanently
+	// 存档中的最大任务数
+	maxArchiveSize = 10000 // maximum number of tasks in archive
+	// 永久删除归档任务的天数
+	archivedExpirationInDays = 90 // number of days before an archived task gets deleted permanently
 )
 
-// KEYS[1] -> asynq:{<qname>}:t:<task_id>
-// KEYS[2] -> asynq:{<qname>}:active
-// KEYS[3] -> asynq:{<qname>}:lease
-// KEYS[4] -> asynq:{<qname>}:archived
-// KEYS[5] -> asynq:{<qname>}:processed:<yyyy-mm-dd>
-// KEYS[6] -> asynq:{<qname>}:failed:<yyyy-mm-dd>
-// KEYS[7] -> asynq:{<qname>}:processed
-// KEYS[8] -> asynq:{<qname>}:failed
+// KEYS[1] -> asynq:{<qname>}:t:<task_id>					// task标识
+// KEYS[2] -> asynq:{<qname>}:active						// active队列名
+// KEYS[3] -> asynq:{<qname>}:lease							// lease队列名
+// KEYS[4] -> asynq:{<qname>}:archived						// archived队列名
+// KEYS[5] -> asynq:{<qname>}:processed:<yyyy-mm-dd>		// 当天processed队列名
+// KEYS[6] -> asynq:{<qname>}:failed:<yyyy-mm-dd>			// 当天failed队列名
+// KEYS[7] -> asynq:{<qname>}:processed						// 总的processed队列名
+// KEYS[8] -> asynq:{<qname>}:failed						// 总的failed队列名
 // -------
-// ARGV[1] -> task ID
-// ARGV[2] -> updated base.TaskMessage value
-// ARGV[3] -> died_at UNIX timestamp
-// ARGV[4] -> cutoff timestamp (e.g., 90 days ago)
-// ARGV[5] -> max number of tasks in archive (e.g., 100)
-// ARGV[6] -> stats expiration timestamp
-// ARGV[7] -> max int64 value
+// ARGV[1] -> task ID										// taskId
+// ARGV[2] -> updated base.TaskMessage value				// task内容
+// ARGV[3] -> died_at UNIX timestamp						// 当前时间
+// ARGV[4] -> cutoff timestamp (e.g., 90 days ago)			// 移除条目的时间
+// ARGV[5] -> max number of tasks in archive (e.g., 100)    // 保留的条目数量
+// ARGV[6] -> stats expiration timestamp					// 过期时间
+// ARGV[7] -> max int64 value								// int64的最大值 标记用
+// LREM active队列名 0 taskId     							// 从active队列中删除taskId
+// ZREM lease队列名 taskId									// 从lease队列中删除
+// ZADD archived队列名 当前时间 taskId						// 添加到archived有序集合
+// ZREMRANGEBYSCORE archived队列名 "-inf" 移除条目的时间		// 删除多久之前的数据
+// ZREMRANGEBYRANK archived队列名 0 1000						// 保留1000条
+// HSET task标识 msg task内容 state "archived"				// 设置task状态
+// INCR 当天processed队列名									// 计数
+// EXPIREAT 当天processed队列名 过期时间						// 设置过期时间
+// INCR 当天failed队列名
+// EXPIREAT 当天failed队列名 过期时间
 var archiveCmd = redis.NewScript(`
 if redis.call("LREM", KEYS[2], 0, ARGV[1]) == 0 then
   return redis.error_reply("NOT FOUND")
@@ -745,8 +860,13 @@ return redis.status_reply("OK")`)
 
 // Archive sends the given task to archive, attaching the error message to the task.
 // It also trims the archive by timestamp and set size.
+// 处理失败的任务进行归档
+// 将给定的任务发送给Archive，并将错误消息附加到任务中。
+// 它还通过时间戳和设置大小来修剪存档。
+// archive队列
 func (r *RDB) Archive(ctx context.Context, msg *base.TaskMessage, errMsg string) error {
 	var op errors.Op = "rdb.Archive"
+	// 设置失败信息
 	now := r.clock.Now()
 	modified := *msg
 	modified.ErrorMsg = errMsg

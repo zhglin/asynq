@@ -17,39 +17,47 @@ import (
 
 // heartbeater is responsible for writing process info to redis periodically to
 // indicate that the background worker process is up.
+// heartbeater负责定期向redis写入进程信息，以表明后台工作进程已启动。
 type heartbeater struct {
 	logger *log.Logger
-	broker base.Broker
-	clock  timeutil.Clock
+	broker base.Broker    // broker实例
+	clock  timeutil.Clock // 时钟
 
 	// channel to communicate back to the long running "heartbeater" goroutine.
+	// 关闭通知
 	done chan struct{}
 
 	// interval between heartbeats.
+	// 间隔时间
 	interval time.Duration
 
 	// following fields are initialized at construction time and are immutable.
-	host           string
-	pid            int
-	serverID       string
-	concurrency    int
-	queues         map[string]int
-	strictPriority bool
+	// 以下字段在构造时初始化，并且是不可变的。
+	host           string         // 当前节点Hostname
+	pid            int            // 进程id
+	serverID       string         // 生成的唯一id
+	concurrency    int            // 并发度
+	queues         map[string]int // 队列优先级
+	strictPriority bool           // 是否应该严格对待队列优先级
 
 	// following fields are mutable and should be accessed only by the
 	// heartbeater goroutine. In other words, confine these variables
 	// to this goroutine only.
-	started time.Time
+	// 下面的字段是可变的，应该只被heartbeater goroutine访问。换句话说，只将这些变量限制在这个goroutine例程中。
+	started time.Time // 启动时间
 	workers map[string]*workerInfo
 
 	// state is shared with other goroutine but is concurrency safe.
+	// state与其他goroutine共享，但是并发安全。
 	state *serverState
 
 	// channels to receive updates on active workers.
+	// 接收当前workers更新的通道。
 	starting <-chan *workerInfo
 	finished <-chan *base.TaskMessage
 }
 
+// 构建heartbeater的参数
 type heartbeaterParams struct {
 	logger         *log.Logger
 	broker         base.Broker
@@ -89,6 +97,7 @@ func newHeartbeater(params heartbeaterParams) *heartbeater {
 	}
 }
 
+// 终止
 func (h *heartbeater) shutdown() {
 	h.logger.Debug("Heartbeater shutting down...")
 	// Signal the heartbeater goroutine to stop.

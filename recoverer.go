@@ -79,6 +79,7 @@ func (r *recoverer) start(wg *sync.WaitGroup) {
 
 // ErrLeaseExpired error indicates that the task failed because the worker working on the task
 // could not extend its lease due to missing heartbeats. The worker may have crashed or got cutoff from the network.
+// 表示任务失败，因为工作在该任务上的worker由于心跳缺失无法延长其租期。工作人员可能已经崩溃或被切断了网络。
 var ErrLeaseExpired = errors.New("asynq: task lease expired")
 
 func (r *recoverer) recover() {

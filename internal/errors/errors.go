@@ -65,6 +65,7 @@ func (e *Error) Unwrap() error {
 }
 
 // Code defines the canonical error code.
+// 定义标准错误代码。
 type Code uint8
 
 // List of canonical error codes.
@@ -98,6 +99,7 @@ func (c Code) String() string {
 
 // Op describes an operation, usually as the package and method,
 // such as "rdb.Enqueue".
+// Op描述了一个操作，通常是包和方法，例如"rdb.Enqueue"。
 type Op string
 
 // E builds an error value from its arguments.
@@ -166,12 +168,15 @@ func CanonicalCode(err error) Code {
 
 var (
 	// ErrNoProcessableTask indicates that there are no tasks ready to be processed.
+	// 指示没有准备好要处理的任务。
 	ErrNoProcessableTask = errors.New("no tasks are ready for processing")
 
 	// ErrDuplicateTask indicates that another task with the same unique key holds the uniqueness lock.
+	// 指示具有相同惟一键的另一个任务持有惟一锁。
 	ErrDuplicateTask = errors.New("task already exists")
 
 	// ErrTaskIdConflict indicates that another task with the same task ID already exist
+	// 表示已经存在与任务ID相同的任务
 	ErrTaskIdConflict = errors.New("task id conflicts with another task")
 )
 

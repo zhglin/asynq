@@ -18,6 +18,7 @@ import (
 
 // Inspector is a client interface to inspect and mutate the state of
 // queues and tasks.
+// Inspector是一个客户端接口，用于检查和修改队列和任务的状态。
 type Inspector struct {
 	rdb *rdb.RDB
 }

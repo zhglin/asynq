@@ -33,6 +33,12 @@ import (
 // will be kept in the archive set.
 // Note that the archive size is finite and once it reaches its max size,
 // oldest tasks in the archive will be deleted.
+// Server负责任务处理和任务生命周期管理。
+// 服务器从队列中提取任务并处理它们。
+// 如果一个任务处理不成功，服务器将调度它重试。
+// 任务将被重试，直到任务被成功处理或达到最大重试次数。
+// 如果一个任务重试完成，它将被移动到存档集，并保留在存档集中。
+// 归档文件的大小是有限的，一旦达到最大大小，归档文件中最老的任务将被删除。
 type Server struct {
 	logger *log.Logger
 
@@ -45,10 +51,10 @@ type Server struct {
 	forwarder     *forwarder
 	processor     *processor
 	syncer        *syncer
-	heartbeater   *heartbeater
+	heartbeater   *heartbeater //
 	subscriber    *subscriber
 	recoverer     *recoverer
-	healthchecker *healthchecker
+	healthchecker *healthchecker // 心跳检查
 	janitor       *janitor
 }
 
@@ -63,15 +69,19 @@ const (
 	// StateNew represents a new server. Server begins in
 	// this state and then transition to StatusActive when
 	// Start or Run is callled.
+	// 表示新创建的server。server开始在这个状态，然后过渡到StatusActive时，Start或Run被调用。
 	srvStateNew serverStateValue = iota
 
 	// StateActive indicates the server is up and active.
+	// StateActive表示服务器处于激活状态。
 	srvStateActive
 
 	// StateStopped indicates the server is up but no longer processing new tasks.
+	// StateStopped 表示服务器已启动，但不再处理新任务。
 	srvStateStopped
 
 	// StateClosed indicates the server has been shutdown.
+	// StateClosed表示服务器已关闭。
 	srvStateClosed
 )
 
@@ -90,22 +100,30 @@ func (s serverStateValue) String() string {
 }
 
 // Config specifies the server's background-task processing behavior.
+// 配置指定服务器的后台任务处理行为。
 type Config struct {
 	// Maximum number of concurrent processing of tasks.
 	//
 	// If set to a zero or negative value, NewServer will overwrite the value
 	// to the number of CPUs usable by the current process.
+	// 最大并发处理数。
+	// 如果设置为0或负值，NewServer会将该值覆盖为当前进程可用的cpu数量。
 	Concurrency int
 
 	// BaseContext optionally specifies a function that returns the base context for Handler invocations on this server.
 	//
 	// If BaseContext is nil, the default is context.Background().
 	// If this is defined, then it MUST return a non-nil context
+	// BaseContext可选地指定一个函数，该函数返回此服务器上Handler调用的基上下文。
+	// 如果BaseContext为nil，则默认为context.Background()。
+	// 如果这个定义了，那么它必须返回一个非空上下文
 	BaseContext func() context.Context
 
 	// Function to calculate retry delay for a failed task.
 	//
 	// By default, it uses exponential backoff algorithm to calculate the delay.
+	// 计算失败任务重试延迟的函数。
+	// 默认使用指数后退算法计算时延。
 	RetryDelayFunc RetryDelayFunc
 
 	// Predicate function to determine whether the error returned from Handler is a failure.
@@ -114,6 +132,9 @@ type Config struct {
 	// rate of the queue.
 	//
 	// By default, if the given error is non-nil the function returns true.
+	// 判断Handler返回的错误是否为失败的谓词函数。
+	// 如果函数返回false, Server将不会增加任务的重试计数器，并且Server将不会记录队列的统计信息(处理和失败的统计信息)，以避免队列的错误率倾斜。
+	// 默认情况下，如果给定的错误是非nil，函数返回true。
 	IsFailure func(error) bool
 
 	// List of queues to process with given priority value. Keys are the names of the
@@ -136,6 +157,18 @@ type Config struct {
 	// the time respectively.
 	//
 	// If a queue has a zero or negative priority value, the queue will be ignored.
+	// 指定优先级值的队列列表。键是队列的名称，值是关联的优先级值。
+	// 如果设置为nil或未指定，服务器将只处理"default"队列。
+	// 优先级被如下处理，以避免低优先级队列被饿死。
+	// Example:
+	//     Queues: map[string]int{
+	//         "critical": 6,
+	//         "default":  3,
+	//         "low":      1,
+	//     }
+	// 在上面的配置中，假设所有队列都不是空的，任务
+	// 在“critical”，“default”，“low”中应该分别处理60%，30%，10%的时间。
+	// 如果一个队列的优先级为0或负数，则该队列将被忽略。
 	Queues map[string]int
 
 	// StrictPriority indicates whether the queue priority should be treated strictly.
@@ -143,6 +176,9 @@ type Config struct {
 	// If set to true, tasks in the queue with the highest priority is processed first.
 	// The tasks in lower priority queues are processed only when those queues with
 	// higher priorities are empty.
+	// StrictPriority是否应该严格对待队列优先级。
+	// 如果设置为true，则优先队列中优先级最高的任务优先处理;
+	// 低优先级队列的任务只有在高优先级队列为空时才会被处理。
 	StrictPriority bool
 
 	// ErrorHandler handles errors returned by the task handler.
@@ -161,47 +197,63 @@ type Config struct {
 	//     })
 	//
 	//     ErrorHandler: asynq.ErrorHandlerFunc(reportError)
+	// ErrorHandler处理任务处理程序返回的错误。
+	// HandleError仅在任务处理程序返回一个非nil错误时被调用。
 	ErrorHandler ErrorHandler
 
 	// Logger specifies the logger used by the server instance.
 	//
 	// If unset, default logger is used.
+	// Logger指定服务器实例使用的记录器。
+	// 如果不设置，则使用默认记录器。
 	Logger Logger
 
 	// LogLevel specifies the minimum log level to enable.
 	//
 	// If unset, InfoLevel is used by default.
+	// LogLevel要启用的最小日志级别。
+	// unset表示默认使用infollevel。
 	LogLevel LogLevel
 
 	// ShutdownTimeout specifies the duration to wait to let workers finish their tasks
 	// before forcing them to abort when stopping the server.
 	//
 	// If unset or zero, default timeout of 8 seconds is used.
+	// ShutdownTimeout指定当服务器停止时，等待workers完成任务的时间，然后强制他们中止。
+	// 如果unset或0，默认超时8秒。
 	ShutdownTimeout time.Duration
 
 	// HealthCheckFunc is called periodically with any errors encountered during ping to the
 	// connected redis server.
+	// HealthCheckFunc在ping连接的redis服务器期间遇到任何错误被周期性地调用。
 	HealthCheckFunc func(error)
 
 	// HealthCheckInterval specifies the interval between healthchecks.
 	//
 	// If unset or zero, the interval is set to 15 seconds.
+	// HealthCheckInterval健康检查间隔时间。
+	// unset或0表示时间间隔为15秒。
 	HealthCheckInterval time.Duration
 
 	// DelayedTaskCheckInterval specifies the interval between checks run on 'scheduled' and 'retry'
 	// tasks, and forwarding them to 'pending' state if they are ready to be processed.
 	//
 	// If unset or zero, the interval is set to 5 seconds.
+	// DelayedTaskCheckInterval指定在'scheduled'和'retry'任务上执行检查的时间间隔，并在它们准备好被处理时将它们转发到'pending'状态。
+	// 如果unset或0，则设置为5秒。
 	DelayedTaskCheckInterval time.Duration
 }
 
 // An ErrorHandler handles an error occured during task processing.
+// ErrorHandler处理任务处理过程中发生的错误。
 type ErrorHandler interface {
 	HandleError(ctx context.Context, task *Task, err error)
 }
 
 // The ErrorHandlerFunc type is an adapter to allow the use of  ordinary functions as a ErrorHandler.
 // If f is a function with the appropriate signature, ErrorHandlerFunc(f) is a ErrorHandler that calls f.
+// ErrorHandlerFunc类型是一个适配器，允许使用普通函数作为ErrorHandler。
+// 如果f是一个具有适当签名的函数，ErrorHandlerFunc(f)是一个调用f的ErrorHandler。
 type ErrorHandlerFunc func(ctx context.Context, task *Task, err error)
 
 // HandleError calls fn(ctx, task, err)
@@ -215,6 +267,10 @@ func (fn ErrorHandlerFunc) HandleError(ctx context.Context, task *Task, err erro
 // n is the number of times the task has been retried.
 // e is the error returned by the task handler.
 // t is the task in question.
+// RetryDelayFunc计算失败任务的重试延迟时间，给出重试次数、错误和任务。
+// n为重试次数。
+// e是任务处理程序返回的错误。
+// t是正在讨论的任务。
 type RetryDelayFunc func(n int, e error, t *Task) time.Duration
 
 // Logger supports logging at various log levels.
@@ -319,6 +375,8 @@ func toInternalLogLevel(l LogLevel) log.Level {
 
 // DefaultRetryDelayFunc is the default RetryDelayFunc used if one is not specified in Config.
 // It uses exponential back-off strategy to calculate the retry delay.
+// DefaultRetryDelayFunc是默认的RetryDelayFunc，如果配置中没有指定。
+// 采用指数后退策略计算重试延迟。
 func DefaultRetryDelayFunc(n int, e error, t *Task) time.Duration {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	// Formula taken from https://github.com/mperham/sidekiq.
@@ -342,27 +400,34 @@ const (
 
 // NewServer returns a new Server given a redis connection option
 // and server configuration.
+// NewServer返回一个新的服务器，给出redis连接选项和服务器配置。
 func NewServer(r RedisConnOpt, cfg Config) *Server {
+	// redis链接
 	c, ok := r.MakeRedisClient().(redis.UniversalClient)
 	if !ok {
 		panic(fmt.Sprintf("asynq: unsupported RedisConnOpt type %T", r))
 	}
+	// 上下文
 	baseCtxFn := cfg.BaseContext
 	if baseCtxFn == nil {
 		baseCtxFn = context.Background
 	}
+	// 并发度
 	n := cfg.Concurrency
 	if n < 1 {
 		n = runtime.NumCPU()
 	}
+	// 重试延迟函数
 	delayFunc := cfg.RetryDelayFunc
 	if delayFunc == nil {
 		delayFunc = DefaultRetryDelayFunc
 	}
+	// 是否失败函数
 	isFailureFunc := cfg.IsFailure
 	if isFailureFunc == nil {
 		isFailureFunc = defaultIsFailureFunc
 	}
+	// 优先级配置
 	queues := make(map[string]int)
 	for qname, p := range cfg.Queues {
 		if err := base.ValidateQueueName(qname); err != nil {
@@ -375,18 +440,22 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 	if len(queues) == 0 {
 		queues = defaultQueueConfig
 	}
+	// 队列名
 	var qnames []string
 	for q := range queues {
 		qnames = append(qnames, q)
 	}
+	// 终止时间
 	shutdownTimeout := cfg.ShutdownTimeout
 	if shutdownTimeout == 0 {
 		shutdownTimeout = defaultShutdownTimeout
 	}
+	// 心跳检查间隔时间
 	healthcheckInterval := cfg.HealthCheckInterval
 	if healthcheckInterval == 0 {
 		healthcheckInterval = defaultHealthCheckInterval
 	}
+	// 日志
 	logger := log.NewLogger(cfg.Logger)
 	loglevel := cfg.LogLevel
 	if loglevel == level_unspecified {
@@ -398,6 +467,7 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 	starting := make(chan *workerInfo)
 	finished := make(chan *base.TaskMessage)
 	syncCh := make(chan *syncRequest)
+	// 服务状态
 	srvState := &serverState{value: srvStateNew}
 	cancels := base.NewCancelations()
 
@@ -421,12 +491,14 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 	if delayedTaskCheckInterval == 0 {
 		delayedTaskCheckInterval = defaultDelayedTaskCheckInterval
 	}
+	// 状态转发
 	forwarder := newForwarder(forwarderParams{
 		logger:   logger,
 		broker:   rdb,
 		queues:   qnames,
 		interval: delayedTaskCheckInterval,
 	})
+	// 订阅
 	subscriber := newSubscriber(subscriberParams{
 		logger:       logger,
 		broker:       rdb,
@@ -495,6 +567,11 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 // One exception to this rule is when ProcessTask returns a SkipRetry error.
 // If the returned error is SkipRetry or an error wraps SkipRetry, retry is
 // skipped and the task will be immediately archived instead.
+// A Handler处理任务。
+// 如果任务处理成功，processstask应该返回nil。
+// 如果ProcessTask返回一个非空的error或panic，如果retry-count还在，任务将在延迟后重试，否则任务将被归档。
+// 这个规则的一个例外是当ProcessTask返回一个SkipRetry错误时。
+// 如果返回的错误是SkipRetry或错误包装了SkipRetry，重试被跳过，该任务将立即被存档。
 type Handler interface {
 	ProcessTask(context.Context, *Task) error
 }
@@ -503,6 +580,7 @@ type Handler interface {
 // ordinary functions as a Handler. If f is a function
 // with the appropriate signature, HandlerFunc(f) is a
 // Handler that calls f.
+// HandlerFunc类型是一个适配器，允许将普通函数作为Handler使用。如果f是一个具有适当签名的函数，HandlerFunc(f)是一个调用f的Handler。
 type HandlerFunc func(context.Context, *Task) error
 
 // ProcessTask calls fn(ctx, task)
@@ -520,6 +598,9 @@ var ErrServerClosed = errors.New("asynq: Server closed")
 //
 // Run returns any error encountered at server startup time.
 // If the server has already been shutdown, ErrServerClosed is returned.
+// 开始任务处理并阻塞，直到收到一个退出程序的os信号。一旦它收到一个信号，它就会优雅地关闭所有活跃的worker和其他goroutines来处理这些任务。
+// 返回在服务器启动时遇到的任何错误。
+// 如果服务器已经关闭，则返回ErrServerClosed。
 func (srv *Server) Run(handler Handler) error {
 	if err := srv.Start(handler); err != nil {
 		return err
@@ -537,12 +618,17 @@ func (srv *Server) Run(handler Handler) error {
 //
 // Start returns any error encountered at server startup time.
 // If the server has already been shutdown, ErrServerClosed is returned.
+// 启动worker服务器。一旦服务器启动，它就从队列中取出任务，并为每个任务启动一个worker goroutine，然后调用Handler来处理它。
+// 任务由worker并发处理，达到Config.Concurrency中指定的并发数。
+// Start返回服务器启动时遇到的任何错误。
+// 如果服务器已经关闭，则返回ErrServerClosed。
 func (srv *Server) Start(handler Handler) error {
 	if handler == nil {
 		return fmt.Errorf("asynq: server cannot run with nil handler")
 	}
 	srv.processor.handler = handler
 
+	// 设置状态
 	if err := srv.start(); err != nil {
 		return err
 	}
@@ -561,6 +647,8 @@ func (srv *Server) Start(handler Handler) error {
 
 // Checks server state and returns an error if pre-condition is not met.
 // Otherwise it sets the server state to active.
+// 检查服务器状态，如果不满足先决条件，返回一个错误。
+// 否则，它设置服务器状态为活动。
 func (srv *Server) start() error {
 	srv.state.mu.Lock()
 	defer srv.state.mu.Unlock()

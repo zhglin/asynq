@@ -13,6 +13,7 @@ import (
 
 // syncer is responsible for queuing up failed requests to redis and retry
 // those requests to sync state between the background process and redis.
+// syncer负责将失败的请求排队到redis，然后重试这些请求，在后台进程和redis之间同步状态。
 type syncer struct {
 	logger *log.Logger
 
@@ -26,9 +27,9 @@ type syncer struct {
 }
 
 type syncRequest struct {
-	fn       func() error // sync operation
-	errMsg   string       // error message
-	deadline time.Time    // request should be dropped if deadline has been exceeded
+	fn       func() error // sync operation	操作
+	errMsg   string       // error message  错误消息
+	deadline time.Time    // request should be dropped if deadline has been exceeded 如果超过了截止日期，请求应该被删除
 }
 
 type syncerParams struct {
@@ -61,6 +62,7 @@ func (s *syncer) start(wg *sync.WaitGroup) {
 			select {
 			case <-s.done:
 				// Try sync one last time before shutting down.
+				// 在关闭之前尝试最后一次同步。
 				for _, req := range requests {
 					if err := req.fn(); err != nil {
 						s.logger.Error(req.errMsg)
