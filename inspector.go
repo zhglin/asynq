@@ -633,6 +633,8 @@ func (i *Inspector) ArchiveTask(qname, id string) error {
 // given a task id. CancelProcessing is best-effort, which means that it does not
 // guarantee that the task with the given id will be canceled. The return
 // value only indicates whether the cancelation signal has been sent.
+// CancelProcessing发送一个信号来取消给定任务id的任务处理。
+// CancelProcessing是尽最大的努力的，这意味着它不能保证具有给定id的任务将被取消。返回值仅表示是否发送了取消信号。
 func (i *Inspector) CancelProcessing(id string) error {
 	return i.rdb.PublishCancelation(id)
 }

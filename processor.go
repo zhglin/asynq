@@ -216,7 +216,7 @@ func (p *processor) exec() {
 			return
 		}
 
-		// 租约
+		// 租约 30秒
 		lease := base.NewLease(leaseExpirationTime)
 		// 任务截止时间
 		deadline := p.computeDeadline(msg)

@@ -901,6 +901,7 @@ func (r *RDB) Archive(ctx context.Context, msg *base.TaskMessage, errMsg string)
 
 // ForwardIfReady checks scheduled and retry sets of the given queues
 // and move any tasks that are ready to be processed to the pending set.
+// ForwardIfReady检查给定队列的scheduled和retry队列，并将任何准备好被处理的任务移动到pending集合。
 func (r *RDB) ForwardIfReady(qnames ...string) error {
 	var op errors.Op = "rdb.ForwardIfReady"
 	for _, qname := range qnames {
@@ -911,12 +912,17 @@ func (r *RDB) ForwardIfReady(qnames ...string) error {
 	return nil
 }
 
-// KEYS[1] -> source queue (e.g. asynq:{<qname>:scheduled or asynq:{<qname>}:retry})
-// KEYS[2] -> asynq:{<qname>}:pending
-// ARGV[1] -> current unix time in seconds
-// ARGV[2] -> task key prefix
-// ARGV[3] -> current unix time in nsec
+// KEYS[1] -> source queue (e.g. asynq:{<qname>:scheduled or asynq:{<qname>}:retry})	// scheduled||retry队列名
+// KEYS[2] -> asynq:{<qname>}:pending													// pending队列名
+// ARGV[1] -> current unix time in seconds												// 当前时间戳
+// ARGV[2] -> task key prefix															// task前缀
+// ARGV[3] -> current unix time in nsec													// 当前纳秒时间戳
 // Note: Script moves tasks up to 100 at a time to keep the runtime of script short.
+// ZRANGEBYSCORE scheduled||retry队列名 -inf 当前时间戳 "LIMIT", 0, 100                     // 返回距离当前时间最小的100个元素
+// LPUSH pending队列名 taskid
+// ZREM scheduled||retry队列名 taskId
+// HSET task标识 state "pending" pending_since 当前纳秒数
+// table.getn(ids) 迁移的长度
 var forwardCmd = redis.NewScript(`
 local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, 100)
 for _, id in ipairs(ids) do
@@ -930,6 +936,7 @@ return table.getn(ids)`)
 
 // forward moves tasks with a score less than the current unix time
 // from the src zset to the dst list. It returns the number of tasks moved.
+// forward将分数小于当前Unix时间的任务从SRC zset移动到DST列表中。它返回已移动任务的数量。
 func (r *RDB) forward(src, dst, taskKeyPrefix string) (int, error) {
 	now := r.clock.Now()
 	res, err := forwardCmd.Run(context.Background(), r.client,
@@ -946,13 +953,17 @@ func (r *RDB) forward(src, dst, taskKeyPrefix string) (int, error) {
 
 // forwardAll checks for tasks in scheduled/retry state that are ready to be run, and updates
 // their state to "pending".
+// forwardAll检查处于scheduled/retry状态的任务是否准备运行，并将其状态更新为“pending”。
 func (r *RDB) forwardAll(qname string) (err error) {
+	// 源队列
 	sources := []string{base.ScheduledKey(qname), base.RetryKey(qname)}
+	// 目标队列
 	dst := base.PendingKey(qname)
+	// task前缀
 	taskKeyPrefix := base.TaskKeyPrefix(qname)
 	for _, src := range sources {
 		n := 1
-		for n != 0 {
+		for n != 0 { // 每次100，直到n=0，把小于当前时间的task全都移到pending队列中
 			n, err = r.forward(src, dst, taskKeyPrefix)
 			if err != nil {
 				return err
@@ -962,12 +973,16 @@ func (r *RDB) forwardAll(qname string) (err error) {
 	return nil
 }
 
-// KEYS[1] -> asynq:{<qname>}:completed
-// ARGV[1] -> current time in unix time
-// ARGV[2] -> task key prefix
-// ARGV[3] -> batch size (i.e. maximum number of tasks to delete)
+// KEYS[1] -> asynq:{<qname>}:completed								// completed队列名
+// ARGV[1] -> current time in unix time								// 当前时间戳
+// ARGV[2] -> task key prefix										// task前缀
+// ARGV[3] -> batch size (i.e. maximum number of tasks to delete)   // 批量数量
 //
 // Returns the number of tasks deleted.
+// ZRANGEBYSCORE completed队列名 "-inf" 当前时间戳  LIMIT 0 批量数量    // 获取截止到当前时间戳的taskId
+// DEL task标识
+// ZREM completed队列名 taskId
+// 返回处理的数量
 var deleteExpiredCompletedTasksCmd = redis.NewScript(`
 local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, tonumber(ARGV[3]))
 for _, id in ipairs(ids) do
@@ -978,9 +993,12 @@ return table.getn(ids)`)
 
 // DeleteExpiredCompletedTasks checks for any expired tasks in the given queue's completed set,
 // and delete all expired tasks.
+// 检查给定队列的已完成集合中任何过期的任务，并删除所有过期的任务。
 func (r *RDB) DeleteExpiredCompletedTasks(qname string) error {
 	// Note: Do this operation in fix batches to prevent long running script.
+	// 注意:该操作需要批量修复，避免脚本长时间运行。
 	const batchSize = 100
+	// 循环处理直到数量为0
 	for {
 		n, err := r.deleteExpiredCompletedTasks(qname, batchSize)
 		if err != nil {
@@ -994,6 +1012,7 @@ func (r *RDB) DeleteExpiredCompletedTasks(qname string) error {
 
 // deleteExpiredCompletedTasks runs the lua script to delete expired deleted task with the specified
 // batch size. It reports the number of tasks deleted.
+// 运行lua脚本删除过期的已删除任务，并指定批处理大小。它报告删除的任务数。
 func (r *RDB) deleteExpiredCompletedTasks(qname string, batchSize int) (int64, error) {
 	var op errors.Op = "rdb.DeleteExpiredCompletedTasks"
 	keys := []string{base.CompletedKey(qname)}
@@ -1013,9 +1032,12 @@ func (r *RDB) deleteExpiredCompletedTasks(qname string, batchSize int) (int64, e
 	return n, nil
 }
 
-// KEYS[1] -> asynq:{<qname>}:lease
-// ARGV[1] -> cutoff in unix time
-// ARGV[2] -> task key prefix
+// KEYS[1] -> asynq:{<qname>}:lease		// lease队列
+// ARGV[1] -> cutoff in unix time		// 时间戳
+// ARGV[2] -> task key prefix			// task前缀
+// ZRANGEBYSCORE lease队列 -inf  时间戳  // 时间戳之前的所有task
+// HGET task
+// 返回所有消息
 var listLeaseExpiredCmd = redis.NewScript(`
 local res = {}
 local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
@@ -1027,10 +1049,12 @@ return res
 `)
 
 // ListLeaseExpired returns a list of task messages with an expired lease from the given queues.
+// 从给定队列返回具有过期租约的任务消息列表。
 func (r *RDB) ListLeaseExpired(cutoff time.Time, qnames ...string) ([]*base.TaskMessage, error) {
 	var op errors.Op = "rdb.ListLeaseExpired"
 	var msgs []*base.TaskMessage
 	for _, qname := range qnames {
+		// 返回当前qname中所有租约过期的消息
 		res, err := listLeaseExpiredCmd.Run(context.Background(), r.client,
 			[]string{base.LeaseKey(qname)},
 			cutoff.Unix(), base.TaskKeyPrefix(qname)).Result()
@@ -1041,6 +1065,7 @@ func (r *RDB) ListLeaseExpired(cutoff time.Time, qnames ...string) ([]*base.Task
 		if err != nil {
 			return nil, errors.E(op, errors.Internal, fmt.Sprintf("cast error: Lua script returned unexpected value: %v", res))
 		}
+		// 对返回的task进行解码返回
 		for _, s := range data {
 			msg, err := base.DecodeMessage([]byte(s))
 			if err != nil {
@@ -1054,6 +1079,8 @@ func (r *RDB) ListLeaseExpired(cutoff time.Time, qnames ...string) ([]*base.Task
 
 // ExtendLease extends the lease for the given tasks by LeaseDuration (30s).
 // It returns a new expiration time if the operation was successful.
+// ExtendLease通过LeaseDuration (30s)扩展指定任务的租期。
+// 如果操作成功，它返回一个新的过期时间。
 func (r *RDB) ExtendLease(qname string, ids ...string) (expirationTime time.Time, err error) {
 	expireAt := r.clock.Now().Add(LeaseDuration)
 	var zs []*redis.Z
@@ -1061,7 +1088,9 @@ func (r *RDB) ExtendLease(qname string, ids ...string) (expirationTime time.Time
 		zs = append(zs, &redis.Z{Member: id, Score: float64(expireAt.Unix())})
 	}
 	// Use XX option to only update elements that already exist; Don't add new elements
+	// 使用XX选项只更新已经存在的元素;不要添加新元素
 	// TODO: Consider adding GT option to ensure we only "extend" the lease. Ceveat is that GT is supported from redis v6.2.0 or above.
+	// 待办事项:考虑添加GT选项，以确保我们只“延长”租约。Ceveat的意思是GT是由redis v6.2.0或更高版本支持的。
 	err = r.client.ZAddXX(context.Background(), base.LeaseKey(qname), zs...).Err()
 	if err != nil {
 		return time.Time{}, err
@@ -1069,13 +1098,17 @@ func (r *RDB) ExtendLease(qname string, ids ...string) (expirationTime time.Time
 	return expireAt, nil
 }
 
-// KEYS[1]  -> asynq:servers:{<host:pid:sid>}
-// KEYS[2]  -> asynq:workers:{<host:pid:sid>}
-// ARGV[1]  -> TTL in seconds
-// ARGV[2]  -> server info
-// ARGV[3:] -> alternate key-value pair of (worker id, worker data)
+// KEYS[1]  -> asynq:servers:{<host:pid:sid>}			// server标识
+// KEYS[2]  -> asynq:workers:{<host:pid:sid>}			// workers标识
+// ARGV[1]  -> TTL in seconds							// 过期时间
+// ARGV[2]  -> server info								// server信息
+// ARGV[3:] -> alternate key-value pair of (worker id, worker data)	 // task信息
 // Note: Add key to ZSET with expiration time as score.
 // ref: https://github.com/antirez/redis/issues/135#issuecomment-2361996
+// SETEX server标识 过期时间 server信息
+// DEl workers标识
+// HSET workers标识 taskId  task
+// EXPIRE workers标识 过期时间
 var writeServerStateCmd = redis.NewScript(`
 redis.call("SETEX", KEYS[1], ARGV[1], ARGV[2])
 redis.call("DEL", KEYS[2])
@@ -1086,14 +1119,18 @@ redis.call("EXPIRE", KEYS[2], ARGV[1])
 return redis.status_reply("OK")`)
 
 // WriteServerState writes server state data to redis with expiration set to the value ttl.
+// WriteServerState将服务器状态数据写入redis，过期时间设置为ttl值。
 func (r *RDB) WriteServerState(info *base.ServerInfo, workers []*base.WorkerInfo, ttl time.Duration) error {
 	var op errors.Op = "rdb.WriteServerState"
 	ctx := context.Background()
+	// 编码serverInfo
 	bytes, err := base.EncodeServerInfo(info)
 	if err != nil {
 		return errors.E(op, errors.Internal, fmt.Sprintf("cannot encode server info: %v", err))
 	}
+	// 过期时间
 	exp := r.clock.Now().Add(ttl).UTC()
+	// lua脚本参数
 	args := []interface{}{ttl.Seconds(), bytes} // args to the lua script
 	for _, w := range workers {
 		bytes, err := base.EncodeWorkerInfo(w)
@@ -1104,40 +1141,51 @@ func (r *RDB) WriteServerState(info *base.ServerInfo, workers []*base.WorkerInfo
 	}
 	skey := base.ServerInfoKey(info.Host, info.PID, info.ServerID)
 	wkey := base.WorkersKey(info.Host, info.PID, info.ServerID)
+	// 单独执行是因为集群模式下key不在同一个slot，lua脚本会执行异常
+	// redis添加server
 	if err := r.client.ZAdd(ctx, base.AllServers, &redis.Z{Score: float64(exp.Unix()), Member: skey}).Err(); err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "sadd", Err: err})
 	}
+	// redis添加workers
 	if err := r.client.ZAdd(ctx, base.AllWorkers, &redis.Z{Score: float64(exp.Unix()), Member: wkey}).Err(); err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "zadd", Err: err})
 	}
 	return r.runScript(ctx, op, writeServerStateCmd, []string{skey, wkey}, args...)
 }
 
-// KEYS[1] -> asynq:servers:{<host:pid:sid>}
-// KEYS[2] -> asynq:workers:{<host:pid:sid>}
+// KEYS[1] -> asynq:servers:{<host:pid:sid>}	// 当前servers标识
+// KEYS[2] -> asynq:workers:{<host:pid:sid>}	// 当前workers标识
+// DEL  当前servers标识
+// DLE  当前workers标识
 var clearServerStateCmd = redis.NewScript(`
 redis.call("DEL", KEYS[1])
 redis.call("DEL", KEYS[2])
 return redis.status_reply("OK")`)
 
 // ClearServerState deletes server state data from redis.
+// 从redis删除服务器状态数据。
 func (r *RDB) ClearServerState(host string, pid int, serverID string) error {
 	var op errors.Op = "rdb.ClearServerState"
 	ctx := context.Background()
 	skey := base.ServerInfoKey(host, pid, serverID)
 	wkey := base.WorkersKey(host, pid, serverID)
+	// 从所有servers有序集合中删除当前server
 	if err := r.client.ZRem(ctx, base.AllServers, skey).Err(); err != nil {
 		return errors.E(op, errors.Internal, &errors.RedisCommandError{Command: "zrem", Err: err})
 	}
+	// 从所有workers中删除当前worker
 	if err := r.client.ZRem(ctx, base.AllWorkers, wkey).Err(); err != nil {
 		return errors.E(op, errors.Internal, &errors.RedisCommandError{Command: "zrem", Err: err})
 	}
 	return r.runScript(ctx, op, clearServerStateCmd, []string{skey, wkey})
 }
 
-// KEYS[1]  -> asynq:schedulers:{<schedulerID>}
-// ARGV[1]  -> TTL in seconds
-// ARGV[2:] -> schedler entries
+// KEYS[1]  -> asynq:schedulers:{<schedulerID>}		// 当前scheduler标识
+// ARGV[1]  -> TTL in seconds						// 过期时间
+// ARGV[2:] -> schedler entries						// 当前scheduler的cron
+// DEL 当前scheduler标识
+// LPUSH 当前scheduler标识 当前scheduler的cron
+// EXPIRE 当前scheduler标识 过期时间
 var writeSchedulerEntriesCmd = redis.NewScript(`
 redis.call("DEL", KEYS[1])
 for i = 2, #ARGV do
@@ -1147,6 +1195,7 @@ redis.call("EXPIRE", KEYS[1], ARGV[1])
 return redis.status_reply("OK")`)
 
 // WriteSchedulerEntries writes scheduler entries data to redis with expiration set to the value ttl.
+// 写入调度程序cron数据到redis，过期时间设置为ttl值。
 func (r *RDB) WriteSchedulerEntries(schedulerID string, entries []*base.SchedulerEntry, ttl time.Duration) error {
 	var op errors.Op = "rdb.WriteSchedulerEntries"
 	ctx := context.Background()
@@ -1160,6 +1209,7 @@ func (r *RDB) WriteSchedulerEntries(schedulerID string, entries []*base.Schedule
 	}
 	exp := r.clock.Now().Add(ttl).UTC()
 	key := base.SchedulerEntriesKey(schedulerID)
+	// scheduler添加到AllSchedulers
 	err := r.client.ZAdd(ctx, base.AllSchedulers, &redis.Z{Score: float64(exp.Unix()), Member: key}).Err()
 	if err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "zadd", Err: err})
@@ -1168,13 +1218,16 @@ func (r *RDB) WriteSchedulerEntries(schedulerID string, entries []*base.Schedule
 }
 
 // ClearSchedulerEntries deletes scheduler entries data from redis.
+// 从redis删除调度器条目数据。
 func (r *RDB) ClearSchedulerEntries(scheduelrID string) error {
 	var op errors.Op = "rdb.ClearSchedulerEntries"
 	ctx := context.Background()
 	key := base.SchedulerEntriesKey(scheduelrID)
+	// 从AllSchedulers中删除schedulr
 	if err := r.client.ZRem(ctx, base.AllSchedulers, key).Err(); err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "zrem", Err: err})
 	}
+	// 删除scheduelrID对应的队列
 	if err := r.client.Del(ctx, key).Err(); err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "del", Err: err})
 	}
@@ -1182,6 +1235,7 @@ func (r *RDB) ClearSchedulerEntries(scheduelrID string) error {
 }
 
 // CancelationPubSub returns a pubsub for cancelation messages.
+// 订阅CancelChannel队列，获取需要取消的taskId
 func (r *RDB) CancelationPubSub() (*redis.PubSub, error) {
 	var op errors.Op = "rdb.CancelationPubSub"
 	ctx := context.Background()
@@ -1195,6 +1249,7 @@ func (r *RDB) CancelationPubSub() (*redis.PubSub, error) {
 
 // PublishCancelation publish cancelation message to all subscribers.
 // The message is the ID for the task to be canceled.
+// 向所有订阅者发布取消消息。消息是要取消的任务的ID。
 func (r *RDB) PublishCancelation(id string) error {
 	var op errors.Op = "rdb.PublishCancelation"
 	ctx := context.Background()
@@ -1204,19 +1259,23 @@ func (r *RDB) PublishCancelation(id string) error {
 	return nil
 }
 
-// KEYS[1] -> asynq:scheduler_history:<entryID>
-// ARGV[1] -> enqueued_at timestamp
-// ARGV[2] -> serialized SchedulerEnqueueEvent data
-// ARGV[3] -> max number of events to be persisted
+// KEYS[1] -> asynq:scheduler_history:<entryID>			// key
+// ARGV[1] -> enqueued_at timestamp						// 时间戳
+// ARGV[2] -> serialized SchedulerEnqueueEvent data		// data
+// ARGV[3] -> max number of events to be persisted		// 保存的条目数
+// ZREMRANGEBYRANK key 0 -1000
+// ZADD key 时间戳 data
 var recordSchedulerEnqueueEventCmd = redis.NewScript(`
 redis.call("ZREMRANGEBYRANK", KEYS[1], 0, -ARGV[3])
 redis.call("ZADD", KEYS[1], ARGV[1], ARGV[2])
 return redis.status_reply("OK")`)
 
 // Maximum number of enqueue events to store per entry.
+// 每个条目存储的最大排队事件数。
 const maxEvents = 1000
 
 // RecordSchedulerEnqueueEvent records the time when the given task was enqueued.
+// 记录给定任务进入队列的时间。
 func (r *RDB) RecordSchedulerEnqueueEvent(entryID string, event *base.SchedulerEnqueueEvent) error {
 	var op errors.Op = "rdb.RecordSchedulerEnqueueEvent"
 	ctx := context.Background()
@@ -1236,10 +1295,12 @@ func (r *RDB) RecordSchedulerEnqueueEvent(entryID string, event *base.SchedulerE
 }
 
 // ClearSchedulerHistory deletes the enqueue event history for the given scheduler entry.
+// 删除给定调度程序条目的入队事件历史记录。
 func (r *RDB) ClearSchedulerHistory(entryID string) error {
 	var op errors.Op = "rdb.ClearSchedulerHistory"
 	ctx := context.Background()
 	key := base.SchedulerHistoryKey(entryID)
+	// 直接del
 	if err := r.client.Del(ctx, key).Err(); err != nil {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "del", Err: err})
 	}

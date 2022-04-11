@@ -15,13 +15,16 @@ import (
 
 // PeriodicTaskManager manages scheduling of periodic tasks.
 // It syncs scheduler's entries by calling the config provider periodically.
+// PeriodicTaskManager管理定时任务调度。
+// 它通过定期调用配置提供程序来同步调度程序的条目。
+// 管理scheduler
 type PeriodicTaskManager struct {
 	s            *Scheduler
-	p            PeriodicTaskConfigProvider
+	p            PeriodicTaskConfigProvider // task信息配置，一次返回多个
 	syncInterval time.Duration
 	done         chan (struct{})
 	wg           sync.WaitGroup
-	m            map[string]string // map[hash]entryID
+	m            map[string]string // map[hash]entryID	// 已添加的task
 }
 
 type PeriodicTaskManagerOpts struct {
@@ -32,6 +35,7 @@ type PeriodicTaskManagerOpts struct {
 	RedisConnOpt RedisConnOpt
 
 	// Optional: scheduler options
+	// 选项
 	*SchedulerOpts
 
 	// Optional: default is 3m
@@ -42,6 +46,8 @@ const defaultSyncInterval = 3 * time.Minute
 
 // NewPeriodicTaskManager returns a new PeriodicTaskManager instance.
 // The given opts should specify the RedisConnOp and PeriodicTaskConfigProvider at minimum.
+// NewPeriodicTaskManager返回一个新的PeriodicTaskManager实例。
+// 给出的选项应该至少指定redisconp和PeriodicTaskConfigProvider。
 func NewPeriodicTaskManager(opts PeriodicTaskManagerOpts) (*PeriodicTaskManager, error) {
 	if opts.PeriodicTaskConfigProvider == nil {
 		return nil, fmt.Errorf("PeriodicTaskConfigProvider cannot be nil")
@@ -49,6 +55,7 @@ func NewPeriodicTaskManager(opts PeriodicTaskManagerOpts) (*PeriodicTaskManager,
 	if opts.RedisConnOpt == nil {
 		return nil, fmt.Errorf("RedisConnOpt cannot be nil")
 	}
+	// 构建scheduler
 	scheduler := NewScheduler(opts.RedisConnOpt, opts.SchedulerOpts)
 	syncInterval := opts.SyncInterval
 	if syncInterval == 0 {
@@ -66,17 +73,21 @@ func NewPeriodicTaskManager(opts PeriodicTaskManagerOpts) (*PeriodicTaskManager,
 // PeriodicTaskConfigProvider provides configs for periodic tasks.
 // GetConfigs will be called by a PeriodicTaskManager periodically to
 // sync the scheduler's entries with the configs returned by the provider.
+// PeriodicTaskConfigProvider提供定时任务配置。
+// GetConfigs将被PeriodicTaskManager定期调用，以将调度器的条目与提供程序返回的configs同步。
 type PeriodicTaskConfigProvider interface {
 	GetConfigs() ([]*PeriodicTaskConfig, error)
 }
 
 // PeriodicTaskConfig specifies the details of a periodic task.
+// 定时任务的详细信息。
 type PeriodicTaskConfig struct {
-	Cronspec string   // required: must be non empty string
-	Task     *Task    // required: must be non nil
-	Opts     []Option // optional: can be nil
+	Cronspec string   // required: must be non empty string	cron表达式
+	Task     *Task    // required: must be non nil	task
+	Opts     []Option // optional: can be nil	task选项
 }
 
+// 对task任务生成hash字符串
 func (c *PeriodicTaskConfig) hash() string {
 	h := sha256.New()
 	io.WriteString(h, c.Cronspec)
@@ -90,6 +101,7 @@ func (c *PeriodicTaskConfig) hash() string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// 校验task相关配置
 func validatePeriodicTaskConfig(c *PeriodicTaskConfig) error {
 	if c == nil {
 		return fmt.Errorf("PeriodicTaskConfig cannot be nil")
@@ -107,13 +119,17 @@ func validatePeriodicTaskConfig(c *PeriodicTaskConfig) error {
 // returned by the provider.
 //
 // Start returns any error encountered at start up time.
+// 启动一个调度程序和后台goroutine，以同步调度程序与配置程序返回。
+// Start返回启动时遇到的任何错误。
 func (mgr *PeriodicTaskManager) Start() error {
 	if mgr.s == nil || mgr.p == nil {
 		panic("asynq: cannot start uninitialized PeriodicTaskManager; use NewPeriodicTaskManager to initialize")
 	}
+	// 添加task
 	if err := mgr.initialSync(); err != nil {
 		return fmt.Errorf("asynq: %v", err)
 	}
+	// 启动scheduler
 	if err := mgr.s.Start(); err != nil {
 		return fmt.Errorf("asynq: %v", err)
 	}
@@ -128,7 +144,7 @@ func (mgr *PeriodicTaskManager) Start() error {
 				ticker.Stop()
 				return
 			case <-ticker.C:
-				mgr.sync()
+				mgr.sync() // 动态调整task
 			}
 		}
 	}()
@@ -145,6 +161,8 @@ func (mgr *PeriodicTaskManager) Shutdown() {
 
 // Run starts the manager and blocks until an os signal to exit the program is received.
 // Once it receives a signal, it gracefully shuts down the manager.
+// 运行启动管理器并阻塞，直到收到一个退出程序的os信号。
+// 一旦它收到一个信号，它优雅地关闭管理器。
 func (mgr *PeriodicTaskManager) Run() error {
 	if err := mgr.Start(); err != nil {
 		return err
@@ -155,11 +173,14 @@ func (mgr *PeriodicTaskManager) Run() error {
 	return nil
 }
 
+// 初始化task
 func (mgr *PeriodicTaskManager) initialSync() error {
+	// 获取task配置
 	configs, err := mgr.p.GetConfigs()
 	if err != nil {
 		return fmt.Errorf("initial call to GetConfigs failed: %v", err)
 	}
+	// 校验task
 	for _, c := range configs {
 		if err := validatePeriodicTaskConfig(c); err != nil {
 			return fmt.Errorf("initial call to GetConfigs contained an invalid config: %v", err)
@@ -169,6 +190,7 @@ func (mgr *PeriodicTaskManager) initialSync() error {
 	return nil
 }
 
+// scheduler中添加task
 func (mgr *PeriodicTaskManager) add(configs []*PeriodicTaskConfig) {
 	for _, c := range configs {
 		entryID, err := mgr.s.Register(c.Cronspec, c.Task, c.Opts...)
@@ -183,6 +205,7 @@ func (mgr *PeriodicTaskManager) add(configs []*PeriodicTaskConfig) {
 	}
 }
 
+// scheduler中删除task
 func (mgr *PeriodicTaskManager) remove(removed map[string]string) {
 	for hash, entryID := range removed {
 		if err := mgr.s.Unregister(entryID); err != nil {
@@ -215,6 +238,7 @@ func (mgr *PeriodicTaskManager) sync() {
 
 // diffRemoved diffs the incoming configs with the registered config and returns
 // a map containing hash and entryID of each config that was removed.
+// diffRemoved将传入的配置与注册的配置进行区分，并返回一个包含哈希值和每个被删除的配置的entryID的映射。
 func (mgr *PeriodicTaskManager) diffRemoved(configs []*PeriodicTaskConfig) map[string]string {
 	newConfigs := make(map[string]string)
 	for _, c := range configs {
@@ -232,6 +256,7 @@ func (mgr *PeriodicTaskManager) diffRemoved(configs []*PeriodicTaskConfig) map[s
 
 // diffAdded diffs the incoming configs with the registered configs and returns
 // a list of configs that were added.
+// 将传入的配置与已注册的配置进行区分，并返回已添加的配置的列表。
 func (mgr *PeriodicTaskManager) diffAdded(configs []*PeriodicTaskConfig) []*PeriodicTaskConfig {
 	var added []*PeriodicTaskConfig
 	for _, c := range configs {

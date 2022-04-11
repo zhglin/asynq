@@ -13,6 +13,7 @@ import (
 	"github.com/hibiken/asynq/internal/log"
 )
 
+// 订阅取消任务队列，进行任务取消
 type subscriber struct {
 	logger *log.Logger
 	broker base.Broker
@@ -21,9 +22,11 @@ type subscriber struct {
 	done chan struct{}
 
 	// cancelations hold cancel functions for all active tasks.
+	// 所有active的task的取消函数
 	cancelations *base.Cancelations
 
 	// time to wait before retrying to connect to redis.
+	// 重新连接redis之前的等待时间。
 	retryTimeout time.Duration
 }
 
@@ -58,6 +61,7 @@ func (s *subscriber) start(wg *sync.WaitGroup) {
 			err    error
 		)
 		// Try until successfully connect to Redis.
+		// 尝试直到成功连接Redis。进行消息订阅
 		for {
 			pubsub, err = s.broker.CancelationPubSub()
 			if err != nil {
@@ -79,10 +83,10 @@ func (s *subscriber) start(wg *sync.WaitGroup) {
 				pubsub.Close()
 				s.logger.Debug("Subscriber done")
 				return
-			case msg := <-cancelCh:
+			case msg := <-cancelCh: // 从队列中获取消息
 				cancel, ok := s.cancelations.Get(msg.Payload)
 				if ok {
-					cancel()
+					cancel() // 取消正在执行的消息
 				}
 			}
 		}

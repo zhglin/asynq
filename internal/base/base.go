@@ -34,11 +34,11 @@ var DefaultQueue = PendingKey(DefaultQueueName)
 
 // Global Redis keys.
 const (
-	AllServers    = "asynq:servers"    // ZSET
-	AllWorkers    = "asynq:workers"    // ZSET
-	AllSchedulers = "asynq:schedulers" // ZSET
-	AllQueues     = "asynq:queues"     // SET
-	CancelChannel = "asynq:cancel"     // PubSub channel
+	AllServers    = "asynq:servers"    // ZSET	// 所有server的有序集合
+	AllWorkers    = "asynq:workers"    // ZSET	// 所有处理中的task有序集合
+	AllSchedulers = "asynq:schedulers" // ZSET	// 所有的scheduler
+	AllQueues     = "asynq:queues"     // SET			// 队列名
+	CancelChannel = "asynq:cancel"     // PubSub channel	// 订阅需要取消的task队列
 )
 
 // TaskState denotes the state of a task.
@@ -182,21 +182,25 @@ func FailedKey(qname string, t time.Time) string {
 }
 
 // ServerInfoKey returns a redis key for process info.
+// 返回server信息的redis键。
 func ServerInfoKey(hostname string, pid int, serverID string) string {
 	return fmt.Sprintf("asynq:servers:{%s:%d:%s}", hostname, pid, serverID)
 }
 
 // WorkersKey returns a redis key for the workers given hostname, pid, and server ID.
+// 返回给定主机名、pid和服务器ID的workers的redis键。
 func WorkersKey(hostname string, pid int, serverID string) string {
 	return fmt.Sprintf("asynq:workers:{%s:%d:%s}", hostname, pid, serverID)
 }
 
 // SchedulerEntriesKey returns a redis key for the scheduler entries given scheduler ID.
+// 给定调度器ID，返回调度器条目的redis key。
 func SchedulerEntriesKey(schedulerID string) string {
 	return fmt.Sprintf("asynq:schedulers:{%s}", schedulerID)
 }
 
 // SchedulerHistoryKey returns a redis key for the scheduler's history for the given entry.
+// 为给定条目返回调度器历史记录的redis键。
 func SchedulerHistoryKey(entryID string) string {
 	return fmt.Sprintf("asynq:scheduler_history:%s", entryID)
 }
@@ -422,6 +426,7 @@ func DecodeServerInfo(b []byte) (*ServerInfo, error) {
 }
 
 // WorkerInfo holds information about a running worker.
+// WorkerInfo保存一个正在运行的worker的信息。task信息
 type WorkerInfo struct {
 	Host     string
 	PID      int
@@ -488,20 +493,26 @@ func DecodeWorkerInfo(b []byte) (*WorkerInfo, error) {
 }
 
 // SchedulerEntry holds information about a periodic task registered with a scheduler.
+// 保存与调度程序注册的cron任务有关的信息。
 type SchedulerEntry struct {
 	// Identifier of this entry.
+	// task id
 	ID string
 
 	// Spec describes the schedule of this entry.
+	// task的cron
 	Spec string
 
 	// Type is the task type of the periodic task.
+	// task的type
 	Type string
 
 	// Payload is the payload of the periodic task.
+	// task的payload
 	Payload []byte
 
 	// Opts is the options for the periodic task.
+	// task的opts
 	Opts []string
 
 	// Next shows the next time the task will be enqueued.
@@ -562,11 +573,14 @@ func DecodeSchedulerEntry(b []byte) (*SchedulerEntry, error) {
 }
 
 // SchedulerEnqueueEvent holds information about an enqueue event by a scheduler.
+// 保存调度程序的排队事件的信息。
 type SchedulerEnqueueEvent struct {
 	// ID of the task that was enqueued.
+	// taskId
 	TaskID string
 
 	// Time the task was enqueued.
+	// 时间
 	EnqueuedAt time.Time
 }
 
@@ -650,6 +664,7 @@ func (c *Cancelations) Get(id string) (fn context.CancelFunc, ok bool) {
 // It provides a communication channel between lessor and lessee about lease expiration.
 // Lease是一个有时间限制的worker处理任务的租期。
 // 它为出租人和承租人提供了一个关于租赁期满的沟通渠道。
+// service没消费到一个task就获取一个租期，task未处理完就定时续租，防止task消费失败，丢失。
 type Lease struct {
 	once sync.Once
 	// 通知channel
@@ -674,6 +689,8 @@ func NewLease(expirationTime time.Time) *Lease {
 
 // Reset chanegs the lease to expire at the given time.
 // It returns true if the lease is still valid and reset operation was successful, false if the lease had been expired.
+// 重置将租约在指定时间到期。
+// 如果租期仍然有效且重置操作成功则返回true，如果租期已过期则返回false。
 func (l *Lease) Reset(expirationTime time.Time) bool {
 	if !l.IsValid() {
 		return false
@@ -684,8 +701,9 @@ func (l *Lease) Reset(expirationTime time.Time) bool {
 	return true
 }
 
-// Sends a notification to lessee about expired lease
+// NotifyExpiration Sends a notification to lessee about expired lease
 // Returns true if notification was sent, returns false if the lease is still valid and notification was not sent.
+// 如果已经发送了通知，则返回true;如果租约仍然有效且未发送通知，则返回false。
 func (l *Lease) NotifyExpiration() bool {
 	if l.IsValid() {
 		return false

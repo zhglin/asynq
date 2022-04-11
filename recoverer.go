@@ -14,19 +14,25 @@ import (
 	"github.com/hibiken/asynq/internal/log"
 )
 
+// 对租约过期的task进行回收
+// 租约过期说明server已经收到消息但是未处理完成并且不在处理。server异常下线
 type recoverer struct {
-	logger         *log.Logger
-	broker         base.Broker
+	logger *log.Logger
+	broker base.Broker
+	// 重试时间计算函数
 	retryDelayFunc RetryDelayFunc
-	isFailureFunc  func(error) bool
+	// 用户层校验task是否处理失败的函数
+	isFailureFunc func(error) bool
 
 	// channel to communicate back to the long running "recoverer" goroutine.
 	done chan struct{}
 
 	// list of queues to check for deadline.
+	// 需要进行recover的队列名
 	queues []string
 
 	// poll interval.
+	// 间隔时间 默认1分钟
 	interval time.Duration
 }
 
@@ -61,7 +67,7 @@ func (r *recoverer) start(wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		r.recover()
+		r.recover() // 定时器之前先执行一次
 		timer := time.NewTimer(r.interval)
 		for {
 			select {
@@ -84,12 +90,15 @@ var ErrLeaseExpired = errors.New("asynq: task lease expired")
 
 func (r *recoverer) recover() {
 	// Get all tasks which have expired 30 seconds ago or earlier to accomodate certain amount of clock skew.
-	cutoff := time.Now().Add(-30 * time.Second)
+	// 获取30秒前或更早过期的所有任务，以适应一定程度的时钟偏差。
+	cutoff := time.Now().Add(-30 * time.Second) // 30秒之前的时间戳
 	msgs, err := r.broker.ListLeaseExpired(cutoff, r.queues...)
 	if err != nil {
 		r.logger.Warn("recoverer: could not list lease expired tasks")
 		return
 	}
+
+	// 对租约过期的task进行重试或者归档
 	for _, msg := range msgs {
 		if msg.Retried >= msg.Retry {
 			r.archive(msg, ErrLeaseExpired)
@@ -99,6 +108,7 @@ func (r *recoverer) recover() {
 	}
 }
 
+// 重试
 func (r *recoverer) retry(msg *base.TaskMessage, err error) {
 	delay := r.retryDelayFunc(msg.Retried, err, NewTask(msg.Type, msg.Payload))
 	retryAt := time.Now().Add(delay)
@@ -107,6 +117,7 @@ func (r *recoverer) retry(msg *base.TaskMessage, err error) {
 	}
 }
 
+// 归档
 func (r *recoverer) archive(msg *base.TaskMessage, err error) {
 	if err := r.broker.Archive(context.Background(), msg, err.Error()); err != nil {
 		r.logger.Warnf("recoverer: could not move task to archive: %v", err)

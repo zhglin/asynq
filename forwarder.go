@@ -14,7 +14,7 @@ import (
 
 // A forwarder is responsible for moving scheduled and retry tasks to pending state
 // so that the tasks get processed by the workers.
-// 转发器负责将scheduled任务和retry任务转移到挂起状态，以便由worker处理这些任务。
+// 转发器负责将scheduled任务和retry任务转移到pending状态，以便由worker处理这些任务。
 type forwarder struct {
 	logger *log.Logger
 	broker base.Broker
@@ -23,6 +23,7 @@ type forwarder struct {
 	done chan struct{}
 
 	// list of queue names to check and enqueue.
+	// 要检查和排队的队列名称列表。
 	queues []string
 
 	// poll interval on average
@@ -70,6 +71,7 @@ func (f *forwarder) start(wg *sync.WaitGroup) {
 	}()
 }
 
+// 执行状态转换
 func (f *forwarder) exec() {
 	if err := f.broker.ForwardIfReady(f.queues...); err != nil {
 		f.logger.Errorf("Failed to forward scheduled tasks: %v", err)

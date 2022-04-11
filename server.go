@@ -42,20 +42,20 @@ import (
 type Server struct {
 	logger *log.Logger
 
-	broker base.Broker
+	broker base.Broker // 存储
 
-	state *serverState
+	state *serverState // 状态
 
 	// wait group to wait for all goroutines to finish.
 	wg            sync.WaitGroup
-	forwarder     *forwarder
-	processor     *processor
-	syncer        *syncer
-	heartbeater   *heartbeater //
-	subscriber    *subscriber
-	recoverer     *recoverer
-	healthchecker *healthchecker // 心跳检查
-	janitor       *janitor
+	forwarder     *forwarder     // scheduled/retry队列转移到pending队列
+	processor     *processor     // task消费处理
+	syncer        *syncer        // 异步请求
+	heartbeater   *heartbeater   // server状态上报
+	subscriber    *subscriber    // 订阅taskId，取消正在执行的task
+	recoverer     *recoverer     // 回收租约过期的task
+	healthchecker *healthchecker // broker心跳检查
+	janitor       *janitor       // 清理已完成的task
 }
 
 type serverState struct {
@@ -464,18 +464,20 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 	logger.SetLevel(toInternalLogLevel(loglevel))
 
 	rdb := rdb.NewRDB(c)
-	starting := make(chan *workerInfo)
-	finished := make(chan *base.TaskMessage)
-	syncCh := make(chan *syncRequest)
+	starting := make(chan *workerInfo)       // 已消费到的task 未完成
+	finished := make(chan *base.TaskMessage) // 已完成的task
+	syncCh := make(chan *syncRequest)        // 异步请求
 	// 服务状态
 	srvState := &serverState{value: srvStateNew}
+	// 所有active的task的取消函数
 	cancels := base.NewCancelations()
-
+	// 异步请求处理
 	syncer := newSyncer(syncerParams{
 		logger:     logger,
 		requestsCh: syncCh,
 		interval:   5 * time.Second,
 	})
+	// server状态上报
 	heartbeater := newHeartbeater(heartbeaterParams{
 		logger:         logger,
 		broker:         rdb,
@@ -498,12 +500,13 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 		queues:   qnames,
 		interval: delayedTaskCheckInterval,
 	})
-	// 订阅
+	// 订阅 取消正在执行的task
 	subscriber := newSubscriber(subscriberParams{
 		logger:       logger,
 		broker:       rdb,
 		cancelations: cancels,
 	})
+	// 消费并处理task
 	processor := newProcessor(processorParams{
 		logger:          logger,
 		broker:          rdb,
@@ -520,6 +523,7 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 		starting:        starting,
 		finished:        finished,
 	})
+	// 回收租约过期的task
 	recoverer := newRecoverer(recovererParams{
 		logger:         logger,
 		broker:         rdb,
@@ -528,12 +532,14 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 		queues:         qnames,
 		interval:       1 * time.Minute,
 	})
+	// broker心跳检查
 	healthchecker := newHealthChecker(healthcheckerParams{
 		logger:          logger,
 		broker:          rdb,
 		interval:        healthcheckInterval,
 		healthcheckFunc: cfg.HealthCheckFunc,
 	})
+	// 清理已完成的task
 	janitor := newJanitor(janitorParams{
 		logger:   logger,
 		broker:   rdb,
@@ -668,6 +674,9 @@ func (srv *Server) start() error {
 // It gracefully closes all active workers. The server will wait for
 // active workers to finish processing tasks for duration specified in Config.ShutdownTimeout.
 // If worker didn't finish processing a task during the timeout, the task will be pushed back to Redis.
+// Shutdown优雅地关闭服务器。
+// 它优雅地关闭所有active worker。服务器将在Config.ShutdownTimeout中指定的时间内等待活动的worker完成处理任务。
+// 如果worker在超时时间内没有完成一个任务的处理，这个任务将被推回Redis。
 func (srv *Server) Shutdown() {
 	srv.state.mu.Lock()
 	if srv.state.value == srvStateNew || srv.state.value == srvStateClosed {
@@ -683,6 +692,10 @@ func (srv *Server) Shutdown() {
 	// Sender goroutines should be terminated before the receiver goroutines.
 	// processor -> syncer (via syncCh)
 	// processor -> heartbeater (via starting, finished channels)
+	//注:关机顺序很重要。
+	//发送端goroutines应该在接收端goroutines之前终止。
+	//processor -> syncer(通过syncCh)
+	//processor -> heartbeater(通过启动，完成通道)
 	srv.forwarder.shutdown()
 	srv.processor.shutdown()
 	srv.recoverer.shutdown()
@@ -702,10 +715,14 @@ func (srv *Server) Shutdown() {
 // currently active tasks are processed before server shutdown.
 //
 // Stop does not shutdown the server, make sure to call Shutdown before exit.
+// Stop表示服务器停止从队列中提取新的任务。
+// 在关闭服务器之前可以使用Stop，以确保在服务器关闭之前所有当前活动的任务都被处理。
+// Stop不关闭服务器，确保在退出前调用shutdown。
 func (srv *Server) Stop() {
 	srv.state.mu.Lock()
 	if srv.state.value != srvStateActive {
 		// Invalid calll to Stop, server can only go from Active state to Stopped state.
+		// 无效的停止调用，服务器只能从Active状态到Stopped状态。
 		srv.state.mu.Unlock()
 		return
 	}
